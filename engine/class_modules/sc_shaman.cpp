@@ -1358,6 +1358,7 @@ public:
 struct shaman_spell_t : public shaman_spell_base_t<spell_t>
 {
   action_t* overload;
+  action_t* primordial_wave_duplicate;
 
 public:
   bool may_proc_stormbringer = false;
@@ -1367,7 +1368,7 @@ public:
 
   shaman_spell_t( util::string_view token, shaman_t* p, const spell_data_t* s = spell_data_t::nil(),
                   const std::string& options = std::string() )
-    : base_t( token, p, s ), overload( nullptr ), proc_sb( nullptr )
+    : base_t( token, p, s ), overload( nullptr ), primordial_wave_duplicate( nullptr ), proc_sb( nullptr )
   {
     parse_options( options );
 
@@ -1465,6 +1466,53 @@ public:
   {
     return 0;
   }
+
+  void trigger_primordial_wave_duplication() const
+  {
+    struct primordial_wave_event_t : public event_t
+    {
+      action_state_t* state;
+
+      primordial_wave_event_t( action_state_t* s )
+        : event_t( *s->action->player, timespan_t::from_millis( 1000 ) ), state( s )
+      {
+      }
+
+      ~primordial_wave_event_t() override
+      {
+        if ( state )
+          action_state_t::release( state );
+      }
+
+      const char* name() const override
+      {
+        return "primordial_wave_event_t";
+      }
+
+      void execute() override
+      {
+        state->action->schedule_execute( state );
+        state = nullptr;
+      }
+    };
+
+    if (!primordial_wave_duplicate)
+      return;
+
+    for ( auto t : sim->target_non_sleeping_list )
+    {
+      shaman_td_t* target_td = td( t );
+
+      if ( target_td->dot.flame_shock->is_ticking())
+      {
+        action_state_t* s = primordial_wave_duplicate->get_state();
+        primordial_wave_duplicate->snapshot_state( s, result_amount_type::DMG_DIRECT );
+        s->target = t;
+
+        make_event<primordial_wave_event_t>( *sim, s );
+      }
+    }
+  };
 
   void trigger_elemental_overload( const action_state_t* source_state ) const
   {
@@ -2680,6 +2728,18 @@ struct elemental_overload_spell_t : public shaman_spell_t
   }
 };
 
+// Primordial Wave duplicates
+struct primordial_wave_spell_t : public shaman_spell_t
+{
+  primordial_wave_spell_t( shaman_t* player, const std::string& name, const spell_data_t* s)
+    : shaman_spell_t( name, player, s )
+  {
+    base_execute_time = timespan_t::zero();
+    background        = true;
+    callbacks         = false;
+  }
+};
+
 // Honestly why even bother with resto heals?
 // shaman_heal_t::impact ====================================================
 
@@ -3861,6 +3921,83 @@ struct flame_shock_spreader_t : public shaman_spell_t
   }
 };
 
+struct primordial_lava_burst_t : public primordial_wave_spell_t
+{
+  unsigned impact_flags;
+
+  primordial_lava_burst_t( shaman_t* player )
+    : primordial_wave_spell_t( player, "primordial_wave_lava_burst", player->find_specialization_spell( "Lava Burst" ))
+  {
+  }
+
+  void init() override
+  {
+    primordial_wave_spell_t::init();
+
+    std::swap( snapshot_flags, impact_flags );
+  }
+
+  void snapshot_impact_state( action_state_t* s, result_amount_type rt )
+  {
+    snapshot_internal( s, impact_flags, rt );
+  }
+
+  double calculate_direct_amount( action_state_t* /* s */ ) const override
+  {
+    // Don't do any extra work, this result won't be used.
+    return 0.0;
+  }
+
+  result_e calculate_result( action_state_t* /* s */ ) const override
+  {
+    // Don't do any extra work, this result won't be used.
+    return RESULT_NONE;
+  }
+
+  void impact( action_state_t* s ) override
+  {
+    // Re-call functions here, before the impact call to do the damage calculations as we impact.
+    snapshot_impact_state( s, amount_type( s ) );
+
+    s->result        = primordial_wave_spell_t::calculate_result( s );
+    s->result_amount = primordial_wave_spell_t::calculate_direct_amount( s );
+
+    primordial_wave_spell_t::impact( s );
+  }
+
+  double action_multiplier() const override
+  {
+    double m = shaman_spell_t::action_multiplier();
+
+    if ( p()->buff.ascendance->up() )
+    {
+      m *= 1.0 + p()->cache.spell_crit_chance();
+    }
+
+    return m;
+  }
+
+  double bonus_da( const action_state_t* s ) const override
+  {
+    double b = shaman_spell_t::bonus_da( s );
+
+    return b;
+  }
+
+  double composite_target_crit_chance( player_t* t ) const override
+  {
+    double m = shaman_spell_t::composite_target_crit_chance( t );
+
+    if ( p()->spec.lava_burst_2->ok() && td( target )->dot.flame_shock->is_ticking() )
+    {
+      // hardcoded because I didn't find it in spelldata yet
+      m = 1.0;
+    }
+
+    return m;
+  }
+};
+
 /**
  * As of 8.1 Lava Burst checks its state on impact. Lava Burst -> Flame Shock now forces the critical strike
  */
@@ -3877,6 +4014,9 @@ struct lava_burst_t : public shaman_spell_t
     {
       base_costs[ RESOURCE_MANA ] = 0;
       maelstrom_gain              = player->find_spell( 343725 )->effectN( 3 ).resource( RESOURCE_MAELSTROM );
+
+      primordial_wave_duplicate = new primordial_lava_burst_t( player );
+      add_child( primordial_wave_duplicate );
     }
 
     if ( player->mastery.elemental_overload->ok() )
@@ -4000,7 +4140,7 @@ struct lava_burst_t : public shaman_spell_t
 
     if ( p()->specialization() == SHAMAN_ELEMENTAL && p()->covenant.necrolord->ok() && p()->buff.primordial_wave->up() )
     {
-      // TODO: trigger a Lava Burst on every Flame Shocked target in the future
+      trigger_primordial_wave_duplication();
       p()->buff.primordial_wave->expire();
     }
 
@@ -4061,6 +4201,14 @@ struct lightning_bolt_overload_t : public elemental_overload_spell_t
   }
 };
 
+struct primordial_lightning_bolt_t : public primordial_wave_spell_t
+{
+  primordial_lightning_bolt_t( shaman_t* player )
+    : primordial_wave_spell_t( player, "primordial_wave_lightning_bolt", player->find_class_spell( "Lightning Bolt" ))
+  {
+  }
+};
+
 struct lightning_bolt_t : public shaman_spell_t
 {
   double m_overcharge;
@@ -4079,6 +4227,12 @@ struct lightning_bolt_t : public shaman_spell_t
     {
       overload = new lightning_bolt_overload_t( player );
       add_child( overload );
+    }
+
+    if ( player->specialization() == SHAMAN_ENHANCEMENT )
+    {
+      primordial_wave_duplicate = new primordial_lava_burst_t( player );
+      add_child( primordial_wave_duplicate );
     }
   }
 
@@ -4180,7 +4334,7 @@ struct lightning_bolt_t : public shaman_spell_t
 
     if ( p()->specialization() == SHAMAN_ENHANCEMENT && p()->covenant.necrolord->ok() && p()->buff.primordial_wave->up() )
     {
-      // TODO: trigger a Lightning Bolt on every Flame Shocked target in the future
+      trigger_primordial_wave_duplication();
       p()->buff.primordial_wave->expire();
     }
 
